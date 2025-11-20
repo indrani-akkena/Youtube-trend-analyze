@@ -1,0 +1,14 @@
+streamlit
+pandas
+numpy
+matplotlib
+prophet
+scikit-learn
+google-api-python-client
+textblob
+python-dotenv
+tensorflow==2.20.0
+tensorflow-hub==0.16.1
+opencv-python
+Pillow
+requests
