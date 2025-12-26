@@ -4,6 +4,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 from prophet import Prophet
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from sklearn.linear_model import LinearRegression
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
@@ -26,10 +27,8 @@ st.set_page_config(
 )
 
 # --- CUSTOM CSS FOR STYLING ---
-# (Your CSS remains the same)
 st.markdown("""
 <style>
-    /* General Styles */
     body {
         background-color: #ee6c4d;
         color: #FAFAFA;
@@ -52,7 +51,6 @@ st.markdown("""
         background-color: #0056b3;
         transform: scale(1.05);
     }
-    /* Card Styles */
     .card {
         background-color: #161B22;
         padding: 20px;
@@ -65,17 +63,30 @@ st.markdown("""
         transform: translateY(-5px);
         box-shadow: 0 8px 16px 0 rgba(0,0,0,0.2);
     }
-            /* On hover, change background to blue and text to white */
-button[data-baseweb="tab"]:hover {
-    background-color: #007BFF; /* Blue color on hover */
-    color: white;
-}
+    button[data-baseweb="tab"]:hover {
+        background-color: #007BFF;
+        color: white;
+    }
     .stMarkdown h1, .stMarkdown h2, .stMarkdown h3 {
         color: #58A6FF;
     }
-            p{
-            color:black}
-    /* Animation */
+    p{
+        color:black
+    }
+    .error-box {
+        background-color: #ff4444;
+        padding: 15px;
+        border-radius: 10px;
+        margin: 10px 0;
+        color: white;
+    }
+    .info-box {
+        background-color: #4444ff;
+        padding: 15px;
+        border-radius: 10px;
+        margin: 10px 0;
+        color: white;
+    }
     @keyframes fadeIn {
         from { opacity: 0; }
         to { opacity: 1; }
@@ -92,10 +103,56 @@ st.image("https://upload.wikimedia.org/wikipedia/commons/4/42/YouTube_icon_%2820
 st.title("YouTube Trends Analyzer")
 st.markdown("### Forecasts, Sentiment Analysis, Fake News Detection & Recommendations")
 
-# --- API AND KEYWORD INPUT ---
+# --- API KEY VALIDATION ---
 load_dotenv()
 API_KEY = os.getenv('API_KEY')
-youtube = build("youtube", "v3", developerKey=API_KEY)
+
+if not API_KEY:
+    st.error("❌ **API_KEY not found!** Please set it in your .env file.")
+    st.info("""
+    **How to fix this:**
+    1. Create a `.env` file in your project root
+    2. Add: `API_KEY=your_youtube_api_key_here`
+    3. Get an API key from: https://console.cloud.google.com/apis/credentials
+    4. Enable YouTube Data API v3 in Google Cloud Console
+    """)
+    st.stop()
+
+# Test API Key
+try:
+    youtube = build("youtube", "v3", developerKey=API_KEY)
+    # Test with a simple API call
+    test_request = youtube.search().list(q="test", part="id", maxResults=1).execute()
+    st.success("✅ API Key validated successfully!")
+except HttpError as e:
+    error_details = str(e)
+    st.error(f"❌ **API Key Error:** {error_details}")
+    
+    if "quotaExceeded" in error_details:
+        st.warning("""
+        **Quota Exceeded!** YouTube API has daily limits:
+        - Free tier: 10,000 units/day
+        - Each search costs ~100 units
+        - Wait 24 hours or upgrade your quota
+        """)
+    elif "API_NOT_ENABLED" in error_details or "accessNotConfigured" in error_details:
+        st.warning("""
+        **YouTube Data API v3 is not enabled!**
+        1. Go to: https://console.cloud.google.com/apis/library/youtube.googleapis.com
+        2. Click "Enable API"
+        3. Wait a few minutes and try again
+        """)
+    elif "invalid" in error_details.lower():
+        st.warning("""
+        **Invalid API Key!**
+        1. Check your API key in the .env file
+        2. Generate a new one at: https://console.cloud.google.com/apis/credentials
+        3. Make sure there are no extra spaces or characters
+        """)
+    st.stop()
+except Exception as e:
+    st.error(f"❌ Unexpected error: {e}")
+    st.stop()
 
 keywords_input = st.text_input(
     "🔑 Enter keyword(s) separated by commas (e.g. AI, Python)",
@@ -114,38 +171,38 @@ SUSPICIOUS_KEYWORDS = [
 ]
 
 # --- OBJECT DETECTION MODEL & LABELS ---
-@st.cache(allow_output_mutation=True)
+@st.cache_resource
 def load_model():
     model_url = "https://tfhub.dev/tensorflow/ssd_mobilenet_v2/2"
     model = hub.load(model_url)
     return model
 
-@st.cache
+@st.cache_data
 def get_coco_labels():
     """Downloads and parses the official COCO label map in a robust way."""
     url = "https://raw.githubusercontent.com/tensorflow/models/master/research/object_detection/data/mscoco_label_map.pbtxt"
     try:
         response = requests.get(url)
-        response.raise_for_status() # Raise an exception for bad status codes
+        response.raise_for_status()
         
         labels = {}
         current_id = None
         
-        # Iterate through the lines to find ID and display_name pairs
         for line in response.text.splitlines():
             if 'id:' in line:
                 current_id = int(line.split(':')[1].strip())
             elif 'display_name:' in line and current_id is not None:
                 display_name = line.split(':')[1].strip().replace('"', '')
                 labels[current_id] = display_name
-                current_id = None # Reset for the next item block
+                current_id = None
         
         if not labels:
-             st.error("Failed to parse COCO labels. Object detection may not work.")
+            st.error("Failed to parse COCO labels. Object detection may not work.")
         return labels
     except requests.exceptions.RequestException as e:
         st.error(f"Could not download COCO labels: {e}")
-        return {} # Return empty dict on failure
+        return {}
+
 detector = load_model()
 COCO_LABELS = get_coco_labels()
 
@@ -157,7 +214,7 @@ def contains_fake_news_text(text):
 
 def detect_objects(image_url):
     try:
-        response = requests.get(image_url)
+        response = requests.get(image_url, timeout=5)
         image = Image.open(BytesIO(response.content))
         image_np = np.array(image)
         input_tensor = tf.convert_to_tensor(image_np)
@@ -170,45 +227,69 @@ def detect_objects(image_url):
         
         detected_objects = []
         for i in range(len(detection_scores)):
-            if detection_scores[i] > 0.5: # Confidence threshold
+            if detection_scores[i] > 0.5:
                 class_id = detection_classes[i]
                 class_name = COCO_LABELS.get(class_id, "Unknown")
                 detected_objects.append(f"{class_name.capitalize()} ({detection_scores[i]:.0%})")
         return detected_objects
     except Exception as e:
-        return [f"Error detecting objects: {e}"]
+        return [f"Error: {str(e)[:50]}"]
 
-# (The rest of your functions: get_video_data, classify_trend, etc. remain the same)
 def get_video_data(keyword, max_results=100):
     videos = []
     next_token = None
-    while len(videos) < max_results:
-        search = youtube.search().list(q=keyword, part="id", type="video",
-                                       maxResults=min(50, max_results - len(videos)),
-                                       pageToken=next_token).execute()
-        ids = [item["id"]["videoId"] for item in search.get("items", [])]
-        if not ids:
-            break
-        video_details = youtube.videos().list(part="statistics,snippet", id=",".join(ids)).execute()
-        for item in video_details["items"]:
-            stats = item["statistics"]
-            snippet = item["snippet"]
-            title = snippet["title"]
-            description = snippet.get("description", "")[:150]
-            fake_news_flag = contains_fake_news_text(title) or contains_fake_news_text(description)
-            videos.append({
-                "video_id": item["id"],
-                "title": title,
-                "description": description,
-                "published_at": pd.to_datetime(snippet["publishedAt"]).date(),
-                "thumbnail": snippet["thumbnails"]["high"]["url"],
-                "views": int(stats.get("viewCount", 0)),
-                "fake_news": fake_news_flag
-            })
-        next_token = search.get("nextPageToken")
-        if not next_token:
-            break
-    return pd.DataFrame(videos)
+    
+    try:
+        while len(videos) < max_results:
+            search = youtube.search().list(
+                q=keyword, 
+                part="id", 
+                type="video",
+                maxResults=min(50, max_results - len(videos)),
+                pageToken=next_token
+            ).execute()
+            
+            ids = [item["id"]["videoId"] for item in search.get("items", [])]
+            if not ids:
+                break
+            
+            video_details = youtube.videos().list(
+                part="statistics,snippet", 
+                id=",".join(ids)
+            ).execute()
+            
+            for item in video_details["items"]:
+                stats = item["statistics"]
+                snippet = item["snippet"]
+                title = snippet["title"]
+                description = snippet.get("description", "")[:150]
+                fake_news_flag = contains_fake_news_text(title) or contains_fake_news_text(description)
+                videos.append({
+                    "video_id": item["id"],
+                    "title": title,
+                    "description": description,
+                    "published_at": pd.to_datetime(snippet["publishedAt"]).date(),
+                    "thumbnail": snippet["thumbnails"]["high"]["url"],
+                    "views": int(stats.get("viewCount", 0)),
+                    "fake_news": fake_news_flag
+                })
+            
+            next_token = search.get("nextPageToken")
+            if not next_token:
+                break
+                
+        return pd.DataFrame(videos)
+        
+    except HttpError as e:
+        error_reason = str(e)
+        if "quotaExceeded" in error_reason:
+            st.error("⚠️ API Quota exceeded. Try again tomorrow or use fewer searches.")
+        else:
+            st.error(f"⚠️ YouTube API Error: {error_reason}")
+        return pd.DataFrame()
+    except Exception as e:
+        st.error(f"⚠️ Unexpected error fetching videos: {e}")
+        return pd.DataFrame()
 
 def classify_trend(series):
     if len(series) < 7:
@@ -235,8 +316,12 @@ def format_views(n):
 def get_comments(video_id, max_comments=50):
     comments = []
     try:
-        req = youtube.commentThreads().list(part="snippet", videoId=video_id,
-                                            maxResults=max_comments, textFormat="plainText").execute()
+        req = youtube.commentThreads().list(
+            part="snippet", 
+            videoId=video_id,
+            maxResults=max_comments, 
+            textFormat="plainText"
+        ).execute()
         for item in req.get("items", []):
             comments.append(item["snippet"]["topLevelComment"]["snippet"]["textDisplay"])
     except:
@@ -247,9 +332,12 @@ def analyze_sentiment(comments):
     results = {"Positive": 0, "Neutral": 0, "Negative": 0}
     for c in comments:
         polarity = TextBlob(c).sentiment.polarity
-        if polarity > 0.1: results["Positive"] += 1
-        elif polarity < -0.1: results["Negative"] += 1
-        else: results["Neutral"] += 1
+        if polarity > 0.1: 
+            results["Positive"] += 1
+        elif polarity < -0.1: 
+            results["Negative"] += 1
+        else: 
+            results["Neutral"] += 1
     return results
 
 def display_top_videos(df):
@@ -262,14 +350,11 @@ def display_top_videos(df):
                 st.markdown('<div class="card">', unsafe_allow_html=True)
                 st.image(row["thumbnail"])
                 
-                # Object Detection
                 with st.spinner("Detecting objects..."):
                     detected_objects = detect_objects(row["thumbnail"])
-                if detected_objects:
-                    st.write("🖼️ **Thumbnail Objects:** ", ", ".join(detected_objects))
-                else:
-                    st.info("No objects detected in thumbnail.")
-
+                if detected_objects and not detected_objects[0].startswith("Error"):
+                    st.write("🖼️ **Objects:** ", ", ".join(detected_objects[:3]))
+                
                 title_display = f"**<a href='https://www.youtube.com/watch?v={row['video_id']}' style='color:white;text-decoration:none;'>{row['title']}</a>**"
                 if row["fake_news"]:
                     title_display += " <span style='color:red;'>⚠️ Potential Fake News</span>"
@@ -288,11 +373,12 @@ def display_top_videos(df):
                     fig.patch.set_facecolor('#161B22')
                     st.pyplot(fig)
                 else:
-                    st.info("No comments to analyze.")
+                    st.info("No comments available.")
                 st.markdown('</div>', unsafe_allow_html=True)
 
 def recommend_similar_topics(df, current_keywords, top_n=5):
-    if df.empty: return pd.DataFrame()
+    if df.empty: 
+        return pd.DataFrame()
     df["text"] = df["title"] + " " + df["description"]
     vectorizer = TfidfVectorizer(stop_words='english', max_features=500)
     tfidf_matrix = vectorizer.fit_transform(df["text"])
@@ -311,11 +397,12 @@ def recommend_similar_topics(df, current_keywords, top_n=5):
                 "thumbnail": df.iloc[idx]["thumbnail"],
                 "similarity": similarities[idx]
             })
-        if len(recommended) >= top_n: break
+        if len(recommended) >= top_n: 
+            break
     return pd.DataFrame(recommended)
 
-# --- APP LOGIC ---
-# (Your main App Logic remains the same)
+
+# --- MAIN APP LOGIC ---
 if keywords:
     for kw in keywords:
         st.markdown(f"--- \n ### 🔍 Results for: `{kw}`")
@@ -323,7 +410,7 @@ if keywords:
             video_df = get_video_data(kw, max_results=100)
 
         if video_df.empty:
-            st.warning("No videos found.")
+            st.warning(f"No videos found for '{kw}' or API error occurred.")
             continue
 
         tab1, tab2, tab3 = st.tabs(["🏆 Top Videos", "📈 Trends & Forecast", "🤝 Recommendations"])
@@ -350,10 +437,13 @@ if keywords:
                 fig, ax = plt.subplots()
                 ax.plot(last_7_days["published_at"], last_7_days["views"], marker='o', color='#007BFF')
                 ax.set_title("Total Daily Views (Past 7 Days)", color='w')
-                ax.set_xlabel("Date", color='w'); ax.set_ylabel("Views", color='w')
+                ax.set_xlabel("Date", color='w')
+                ax.set_ylabel("Views", color='w')
                 ax.grid(True, linestyle='--', alpha=0.3)
-                fig.patch.set_facecolor('#161B22'); ax.set_facecolor('#0E1117')
-                plt.xticks(rotation=45, color='w'); plt.yticks(color='w')
+                fig.patch.set_facecolor('#161B22')
+                ax.set_facecolor('#0E1117')
+                plt.xticks(rotation=45, color='w')
+                plt.yticks(color='w')
                 st.pyplot(fig)
 
             with col2:
@@ -362,12 +452,16 @@ if keywords:
                     model, forecast = result
                     fig2 = model.plot(forecast)
                     fig2.gca().set_title("Prophet Forecast", color='w')
-                    fig2.gca().set_xlabel("Date", color='w'); fig2.gca().set_ylabel("Views", color='w')
-                    fig2.patch.set_facecolor('#161B22'); ax.set_facecolor('#0E1117')
-                    plt.xticks(color='w'); plt.yticks(color='w')
+                    fig2.gca().set_xlabel("Date", color='w')
+                    fig2.gca().set_ylabel("Views", color='w')
+                    fig2.patch.set_facecolor('#161B22')
+                    fig2.gca().set_facecolor('#0E1117')
+                    plt.xticks(color='w')
+                    plt.yticks(color='w')
                     st.pyplot(fig2)
                 else:
                     st.warning("Not enough data to build a reliable forecast.")
+                    
         with tab3:
             st.subheader("🤝 Recommended Similar Videos")
             recs_df = recommend_similar_topics(video_df, [kw], top_n=5)
@@ -379,17 +473,14 @@ if keywords:
                     c1, c2 = st.columns([1, 4])
                     with c1: 
                         st.image(rec["thumbnail"])
-                        # Object Detection
-                        with st.spinner("Detecting objects..."):
-                           detected_objects = detect_objects(rec["thumbnail"])
-                        if detected_objects:
-                           st.write("🖼️ **Objects:** ", ", ".join(detected_objects))
-                        else:
-                           st.info("No objects detected.")
+                        with st.spinner("Detecting..."):
+                            detected_objects = detect_objects(rec["thumbnail"])
+                        if detected_objects and not detected_objects[0].startswith("Error"):
+                            st.caption("🖼️ " + ", ".join(detected_objects[:2]))
                     with c2:
                         st.markdown(f"**<a href='https://www.youtube.com/watch?v={rec['video_id']}' style='color:white;text-decoration:none;'>{rec['title']}</a>**", unsafe_allow_html=True)
                         st.caption(rec["description"])
-                        st.write(f"👁️ Views: {format_views(rec['views'])}")
+                        st.write(f"👁️ {format_views(rec['views'])}")
                     st.markdown('</div>', unsafe_allow_html=True)
 else:
     st.info("👋 Welcome! Please enter a keyword above to begin your analysis.")
